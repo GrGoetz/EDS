@@ -3,15 +3,75 @@ import argparse
 import matplotlib.pyplot as plt
 import numpy as np
 import hyperspy.api as hs
+from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks, peak_widths
 
 
 BIN_WIDTH_KEV = 0.02
 GA_LA_KEV = 1.09799
 GA_KA_KEV = 9.24312
+ASLS_SMOOTHNESS = 1e6
+ASLS_ASYMMETRY = 0.0005
+ASLS_MAX_ITER = 20
+BACKGROUND_OFFSET = -75.0
+ASLS_EDGE_PAD = 10
+BACKGROUND_SMOOTH_SIGMA = 0.5
+BACKGROUND_TAIL_START_KEV = 13.0
+BACKGROUND_TAIL_FRACTION = 0.76
+BACKGROUND_TAIL_BLEND_WIDTH_KEV = 3.0
+MIN_SUBTRACTED_COUNT = 1e-3
+LOW_ENERGY_PEAK_MAX_KEV = 12.0
+LOW_ENERGY_MIN_REL_HEIGHT = 0.0012
+LOW_ENERGY_MIN_REL_PROMINENCE = 0.00045
+LOW_ENERGY_MIN_DISTANCE_POINTS = 4
+MID_ENERGY_PEAK_MAX_KEV = 16.5
+MID_ENERGY_MIN_REL_HEIGHT = 0.0015
+MID_ENERGY_MIN_REL_PROMINENCE = 0.0007
+MID_ENERGY_MIN_DISTANCE_POINTS = 8
+HIGH_ENERGY_MIN_REL_HEIGHT = 0.00022
+HIGH_ENERGY_MIN_REL_PROMINENCE = 0.0002
+HIGH_ENERGY_MIN_DISTANCE_POINTS = 20
+HIGH_ENERGY_SMOOTH_SIGMA = 2.0
+HIGH_ENERGY_MIN_WIDTH_POINTS = 3
+HIGH_ENERGY_MAX_PEAKS = 3
+Y_SCALE = "linear"
 
 def energy_step(energy):
     return float(np.median(np.diff(energy))) if len(energy) > 1 else BIN_WIDTH_KEV
+
+
+def resolve_y_scale(y_scale=None):
+    return Y_SCALE if y_scale is None else y_scale
+
+
+def apply_y_axis(ax, y_scale, *series):
+    y_scale = resolve_y_scale(y_scale)
+    positive_values = []
+    for values in series:
+        array = np.asarray(values, dtype=float)
+        positive_values.extend(array[array > 0])
+
+    if not positive_values:
+        return
+
+    ymin = min(positive_values)
+    ymax = max(positive_values)
+
+    if y_scale == "log":
+        ax.set_yscale("symlog", linthresh=max(1.0, ymin), linscale=1.0)
+        ax.set_ylim(bottom=ymin * 0.8, top=ymax * 1.2)
+    else:
+        ax.set_yscale("linear")
+        ax.set_ylim(bottom=0, top=ymax * 1.05)
+
+
+def add_peak_label_headroom(ax, peak_fits, factor=6.0):
+    if not peak_fits:
+        return
+
+    _, current_top = ax.get_ylim()
+    peak_top = max(float(peak["height"]) for peak in peak_fits)
+    ax.set_ylim(top=max(current_top, peak_top * float(factor)))
 
 
 def create_signal_from_counts(filepath, energy, counts, bin_width_kev):
@@ -115,7 +175,8 @@ def calibrate_signal_with_reference_peaks(signal, peak_fits, reference_energies,
     return calibrated_signal, calibration
 
 
-def plot_spectrum_comparison(energy, counts, signal, subtract_bg, background, bg_method):
+def plot_spectrum_comparison(energy, counts, signal, subtract_bg, background, bg_method, y_scale=None):
+    y_scale = resolve_y_scale(y_scale)
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.plot(energy, counts, label="With Bremsstrahlung", color="black", linestyle=":")
 
@@ -139,7 +200,12 @@ def plot_spectrum_comparison(energy, counts, signal, subtract_bg, background, bg
     )
     ax.set_xlabel("Energy (keV)")
     ax.set_ylabel("Counts")
+    if subtract_bg and background is not None:
+        apply_y_axis(ax, y_scale, counts, background, signal.data)
+    else:
+        apply_y_axis(ax, y_scale, counts, signal.data)
     ax.set_title("Spectrum Comparison")
+    ax.grid(True, which="both", linestyle=":", linewidth=0.7, alpha=0.7)
     ax.legend()
     fig.tight_layout()
     plt.show()
@@ -233,35 +299,72 @@ def estimate_polynomial_background(energy, counts, degree=2):
     return np.polyval(coeffs, energy)
 
 
-def estimate_asls_background(counts, smoothness=1e6, asymmetry=0.01, max_iter=20):
+def estimate_asls_background(
+    counts,
+    smoothness=ASLS_SMOOTHNESS,
+    asymmetry=ASLS_ASYMMETRY,
+    max_iter=ASLS_MAX_ITER,
+):
     counts = np.asarray(counts, dtype=float)
     n_points = len(counts)
 
     if n_points < 3:
         return counts.copy()
 
-    diff_matrix = np.diff(np.eye(n_points), 2, axis=0)
+    pad = max(0, min(int(ASLS_EDGE_PAD), max(0, n_points - 1)))
+    padded_counts = np.pad(counts, pad_width=pad, mode="reflect") if pad else counts
+    n_padded = len(padded_counts)
+
+    diff_matrix = np.diff(np.eye(n_padded), 2, axis=0)
     penalty = smoothness * (diff_matrix.T @ diff_matrix)
-    weights = np.ones(n_points, dtype=float)
+    weights = np.ones(n_padded, dtype=float)
 
     for _ in range(max_iter):
         weighted_system = np.diag(weights) + penalty
-        baseline = np.linalg.solve(weighted_system, weights * counts)
-        new_weights = np.where(counts > baseline, asymmetry, 1.0 - asymmetry)
+        baseline = np.linalg.solve(weighted_system, weights * padded_counts)
+        new_weights = np.where(padded_counts > baseline, asymmetry, 1.0 - asymmetry)
 
         if np.allclose(new_weights, weights):
             break
 
         weights = new_weights
 
+    if pad:
+        baseline = baseline[pad:-pad]
+
+    baseline = gaussian_filter1d(baseline, sigma=BACKGROUND_SMOOTH_SIGMA, mode="nearest")
     return baseline
+
+
+def stabilize_background_tail(energy, counts, background):
+    energy = np.asarray(energy, dtype=float)
+    counts = np.asarray(counts, dtype=float)
+    background = np.asarray(background, dtype=float)
+
+    if len(background) == 0:
+        return background
+
+    transition_center = float(BACKGROUND_TAIL_START_KEV)
+    blend_width = max(float(BACKGROUND_TAIL_BLEND_WIDTH_KEV), 1e-6)
+    transition = np.clip((energy - transition_center) / blend_width, 0.0, 1.0)
+
+    if not np.any(transition > 0):
+        return background
+
+    tail_counts = gaussian_filter1d(counts, sigma=8.0, mode="nearest")
+    tail_floor = np.maximum(
+        1.0,
+        float(BACKGROUND_TAIL_FRACTION) * tail_counts,
+    )
+    lifted_background = np.maximum(background, tail_floor)
+    return (1.0 - transition) * background + transition * lifted_background
 
 
 def find_signal_peaks(
     signal,
-    max_peaks=20,
-    min_rel_height=0.001,
-    min_rel_prominence=0.0003,
+    max_peaks=50,
+    min_rel_height=0.0007,
+    min_rel_prominence=0.00025,
     min_distance_points=1,
 ):
     energy = np.asarray(signal.axes_manager.signal_axes[0].axis, dtype=float)
@@ -270,15 +373,63 @@ def find_signal_peaks(
     if len(counts) < 3 or np.max(counts) <= 0:
         return []
 
-    peak_indices, properties = find_peaks(
-        counts,
-        height=float(np.max(counts) * min_rel_height),
-        prominence=float(np.max(counts) * min_rel_prominence),
-        distance=max(1, int(min_distance_points)),
-    )
+    max_count = float(np.max(counts))
+    low_mask = energy < float(LOW_ENERGY_PEAK_MAX_KEV)
+    mid_mask = (energy >= float(LOW_ENERGY_PEAK_MAX_KEV)) & (energy < float(MID_ENERGY_PEAK_MAX_KEV))
+    high_mask = energy >= float(MID_ENERGY_PEAK_MAX_KEV)
+
+    peak_indices = []
+    peak_heights = []
+
+    if np.any(low_mask):
+        low_indices, low_properties = find_peaks(
+            counts[low_mask],
+            height=max_count * max(float(min_rel_height), float(LOW_ENERGY_MIN_REL_HEIGHT)),
+            prominence=max_count * max(float(min_rel_prominence), float(LOW_ENERGY_MIN_REL_PROMINENCE)),
+            distance=max(max(1, int(min_distance_points)), int(LOW_ENERGY_MIN_DISTANCE_POINTS)),
+        )
+        low_offset = int(np.flatnonzero(low_mask)[0])
+        peak_indices.extend((low_indices + low_offset).tolist())
+        peak_heights.extend(low_properties.get("peak_heights", []).tolist())
+
+    if np.any(mid_mask):
+        mid_indices, mid_properties = find_peaks(
+            counts[mid_mask],
+            height=max_count * max(float(min_rel_height), float(MID_ENERGY_MIN_REL_HEIGHT)),
+            prominence=max_count * max(float(min_rel_prominence), float(MID_ENERGY_MIN_REL_PROMINENCE)),
+            distance=max(max(1, int(min_distance_points)), int(MID_ENERGY_MIN_DISTANCE_POINTS)),
+        )
+        mid_offset = int(np.flatnonzero(mid_mask)[0])
+        peak_indices.extend((mid_indices + mid_offset).tolist())
+        peak_heights.extend(mid_properties.get("peak_heights", []).tolist())
+
+    if np.any(high_mask):
+        high_counts = gaussian_filter1d(
+            counts[high_mask],
+            sigma=float(HIGH_ENERGY_SMOOTH_SIGMA),
+            mode="nearest",
+        )
+        high_indices, high_properties = find_peaks(
+            high_counts,
+            height=max_count * min(float(min_rel_height), float(HIGH_ENERGY_MIN_REL_HEIGHT)),
+            prominence=max_count * min(float(min_rel_prominence), float(HIGH_ENERGY_MIN_REL_PROMINENCE)),
+            distance=max(max(1, int(min_distance_points)), int(HIGH_ENERGY_MIN_DISTANCE_POINTS)),
+            width=int(HIGH_ENERGY_MIN_WIDTH_POINTS),
+        )
+        if len(high_indices) > int(HIGH_ENERGY_MAX_PEAKS):
+            ranking = np.argsort(high_properties.get("peak_heights", np.array([])))[::-1][: int(HIGH_ENERGY_MAX_PEAKS)]
+            high_indices = high_indices[ranking]
+            for key, values in high_properties.items():
+                high_properties[key] = values[ranking]
+        high_offset = int(np.flatnonzero(high_mask)[0])
+        peak_indices.extend((high_indices + high_offset).tolist())
+        peak_heights.extend(high_counts[high_indices].tolist())
 
     if len(peak_indices) == 0:
         return []
+
+    peak_indices = np.asarray(peak_indices, dtype=int)
+    peak_heights = np.asarray(peak_heights, dtype=float)
 
     widths = peak_widths(counts, peak_indices, rel_height=0.5)[0]
 
@@ -286,7 +437,7 @@ def find_signal_peaks(
         (
             {
                 "center": float(energy[index]),
-                "height": float(properties["peak_heights"][i]),
+                "height": float(peak_heights[i]),
                 "width": float(widths[i] * energy_step(energy)),
             }
             for i, index in enumerate(peak_indices)
@@ -298,22 +449,47 @@ def find_signal_peaks(
     return sorted(peaks, key=lambda peak: peak["center"])
 
 
-def annotate_peaks(ax, peak_fits, show_markers=True, color="tab:red"):
+def annotate_peaks(ax, peak_fits, y_scale=None, show_markers=True, show_lines=True, color="tab:red"):
+    y_scale = resolve_y_scale(y_scale)
+    _, y_top = ax.get_ylim()
+    label_factors = [1.18, 1.32, 1.48]
+
     for label_index, peak in enumerate(peak_fits):
         center = peak["center"]
+        peak_height = float(peak["height"])
+        label_y = min(peak_height * label_factors[label_index % len(label_factors)], y_top * 0.78)
+
+        if show_lines:
+            ax.axvline(center, color=color, linestyle="--", linewidth=0.8, alpha=0.35, zorder=1)
         if show_markers:
-            ax.scatter([center], [peak["height"]], color=color, s=24, zorder=5)
-        ax.annotate(
-            f"{center:.3f} keV",
-            xy=(center, peak["height"]),
-            xytext=(0, 10 + 12 * (label_index % 3)),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            rotation=90,
-            color=color,
-            fontsize=9,
-        )
+            ax.scatter([center], [peak_height], color=color, s=24, zorder=5)
+        if y_scale == "linear":
+            ax.annotate(
+                f"{center:.3f} keV",
+                xy=(center, peak_height),
+                xytext=(0, 8 + 10 * (label_index % 3)),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                rotation=90,
+                color=color,
+                fontsize=8,
+                clip_on=True,
+            )
+        else:
+            ax.annotate(
+                f"{center:.3f} keV",
+                xy=(center, peak_height),
+                xytext=(center, label_y),
+                textcoords="data",
+                ha="center",
+                va="bottom",
+                rotation=90,
+                color=color,
+                fontsize=8,
+                clip_on=False,
+                arrowprops={"arrowstyle": "-", "color": color, "lw": 0.8, "alpha": 0.6},
+            )
 
 
 def strongest_signal_index(signals):
@@ -325,13 +501,16 @@ def strongest_signal_index(signals):
     )
 
 
-def plot_overlay_with_peak_labels(signals):
+def plot_overlay_with_peak_labels(signals, y_scale=None):
+    y_scale = resolve_y_scale(y_scale)
     fig, ax = plt.subplots(figsize=(11, 6))
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+    plotted_counts = []
 
     for index, signal in enumerate(signals):
         energy = np.asarray(signal.axes_manager.signal_axes[0].axis, dtype=float)
         counts = np.asarray(signal.data, dtype=float)
+        plotted_counts.append(counts)
         title = getattr(signal.metadata.General, "title", f"Spectrum {index + 1}")
         color = colors[index % len(colors)] if colors else None
         ax.plot(energy, counts, label=title, color=color)
@@ -340,30 +519,39 @@ def plot_overlay_with_peak_labels(signals):
     reference_signal = signals[reference_index]
     reference_peak_fits = getattr(reference_signal, "_peak_fits", [])
     reference_color = colors[reference_index % len(colors)] if colors else "tab:orange"
+    apply_y_axis(ax, y_scale, *plotted_counts)
+    if y_scale == "log":
+        add_peak_label_headroom(ax, reference_peak_fits)
     annotate_peaks(
         ax,
         reference_peak_fits,
+        y_scale=y_scale,
         show_markers=False,
         color=reference_color,
     )
 
     ax.set_xlabel("Energy (keV)")
     ax.set_ylabel("Counts")
-    ax.set_title("Processed Spectra with Peak Labels")
+    ax.set_title("Processed Spectra with Peak Labels", pad=28)
+    ax.grid(True, which="both", linestyle=":", linewidth=0.7, alpha=0.7)
     ax.legend()
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.86))
     plt.show()
 
 
-def plot_peak_identification(signal, peak_fits, calibration=None):
-    fig, ax = plt.subplots(figsize=(11, 6))
+def plot_peak_identification(signal, peak_fits, calibration=None, y_scale=None):
+    y_scale = resolve_y_scale(y_scale)
+    fig, ax = plt.subplots(figsize=(11, 7))
     energy = np.asarray(signal.axes_manager.signal_axes[0].axis, dtype=float)
     counts = np.asarray(signal.data, dtype=float)
 
     ax.plot(energy, counts, color="tab:orange", label="Processed Spectrum")
-    annotate_peaks(ax, peak_fits, show_markers=True)
     ax.set_xlabel("Energy (keV)")
     ax.set_ylabel("Counts")
+    apply_y_axis(ax, y_scale, counts)
+    if y_scale == "log":
+        add_peak_label_headroom(ax, peak_fits)
+    annotate_peaks(ax, peak_fits, y_scale=y_scale, show_markers=True)
     title = f"Peak Identification: {signal.metadata.General.title}"
     if calibration is not None:
         title = f"{title} (Ga calibrated)"
@@ -371,7 +559,7 @@ def plot_peak_identification(signal, peak_fits, calibration=None):
         energies = calibration["reference_energies"]
         positions = calibration["reference_positions"]
         ax.text(
-            0.02,
+            0.98,
             0.98,
             (
                 f"{labels[0]} -> {energies[0]:.5f} keV at channel {positions[0]:.2f}\n"
@@ -380,13 +568,14 @@ def plot_peak_identification(signal, peak_fits, calibration=None):
             ),
             transform=ax.transAxes,
             va="top",
-            ha="left",
+            ha="right",
             fontsize=9,
             bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.8"},
         )
-    ax.set_title(title)
+    ax.set_title(title, pad=28)
+    ax.grid(True, which="both", linestyle=":", linewidth=0.7, alpha=0.7)
     ax.legend()
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.84))
     plt.show()
 
 
@@ -400,11 +589,13 @@ def build_eds_signal(
     bg_method="asls",
     bg_degree=2,
     fit_peaks=True,
-    max_peaks=20,
-    min_rel_height=0.001,
-    min_rel_prominence=0.0003,
+    max_peaks=50,
+    min_rel_height=0.0007,
+    min_rel_prominence=0.00025,
     min_distance_points=1,
+    y_scale=None,
 ):
+    y_scale = resolve_y_scale(y_scale)
     energy, counts = read_eds_txt(filepath)
     signal = create_signal_from_counts(filepath, energy, counts, bin_width_kev)
 
@@ -433,7 +624,7 @@ def build_eds_signal(
         except ValueError as exc:
             print(f"Skipping Ga calibration for {Path(filepath).name}: {exc}")
 
-    plot_spectrum_comparison(energy, counts, signal, subtract_bg, background, bg_method)
+    plot_spectrum_comparison(energy, counts, signal, subtract_bg, background, bg_method, y_scale)
 
     if fit_peaks:
         peak_fits = find_signal_peaks(
@@ -445,7 +636,7 @@ def build_eds_signal(
         )
         signal._peak_fits = peak_fits
         signal._calibration = calibration
-        plot_peak_identification(signal, peak_fits, calibration=calibration)
+        plot_peak_identification(signal, peak_fits, calibration=calibration, y_scale=y_scale)
     else:
         signal._peak_fits = []
         signal._calibration = calibration
@@ -481,8 +672,10 @@ def subtract_background(signal, method="asls", degree=2):
     else:
         raise ValueError(f"Unsupported background subtraction method: {method}")
 
+    background = np.asarray(background, dtype=float) + float(BACKGROUND_OFFSET)
+    background = stabilize_background_tail(energy, counts, background)
     background = np.clip(background, 0, counts)
-    corrected = np.clip(counts - background, 0, None)
+    corrected = np.clip(counts - background, float(MIN_SUBTRACTED_COUNT), None)
 
     signal = make_signal_from_data(
         corrected,
@@ -503,12 +696,14 @@ def plot_eds(
     bg_method="asls",
     bg_degree=2,
     fit_peaks=True,
-    max_peaks=20,
-    min_rel_height=0.001,
-    min_rel_prominence=0.0003,
+    max_peaks=50,
+    min_rel_height=0.0007,
+    min_rel_prominence=0.00025,
     min_distance_points=1,
+    y_scale=None,
 ):
     """Plot one or multiple EDS spectra with HyperSpy."""
+    y_scale = resolve_y_scale(y_scale)
     signals = [
         build_eds_signal(
             file,
@@ -522,12 +717,13 @@ def plot_eds(
             min_rel_height=min_rel_height,
             min_rel_prominence=min_rel_prominence,
             min_distance_points=min_distance_points,
+            y_scale=y_scale,
         )
         for file in files
     ]
 
     if overlay:
-        plot_overlay_with_peak_labels(signals)
+        plot_overlay_with_peak_labels(signals, y_scale=y_scale)
     else:
         for signal in signals:
             signal.plot()
@@ -536,6 +732,7 @@ def plot_eds(
 
 
 def main():
+    global Y_SCALE
     parser = argparse.ArgumentParser(
         description="Read EDS spectra from txt files, process them, and plot with HyperSpy."
     )
@@ -606,20 +803,20 @@ def main():
     parser.add_argument(
         "--max-peaks",
         type=int,
-        default=20,
-        help="Maximum number of peaks to annotate (default: 20)"
+        default=50,
+        help="Maximum number of peaks to annotate (default: 50)"
     )
     parser.add_argument(
         "--min-rel-height",
         type=float,
-        default=0.001,
-        help="Minimum peak height relative to the spectrum maximum (default: 0.001)"
+        default=0.0007,
+        help="Minimum peak height relative to the spectrum maximum (default: 0.0007)"
     )
     parser.add_argument(
         "--min-rel-prominence",
         type=float,
-        default=0.0003,
-        help="Minimum relative slope threshold for HyperSpy peak detection (default: 0.0003)"
+        default=0.00025,
+        help="Minimum relative slope threshold for HyperSpy peak detection (default: 0.00025)"
     )
     parser.add_argument(
         "--min-distance-points",
@@ -627,7 +824,15 @@ def main():
         default=1,
         help="Minimum spacing between detected peaks in data points (default: 1)"
     )
+    parser.add_argument(
+        "--y-scale",
+        type=str,
+        default="linear",
+        choices=["linear", "log"],
+        help="Y-axis scaling for plots (default: linear)"
+    )
     args = parser.parse_args()
+    Y_SCALE = args.y_scale
 
     plot_eds(
         args.files,

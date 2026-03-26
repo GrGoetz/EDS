@@ -1,0 +1,15 @@
+{
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.exspy": true,
+    "**/.hyperspy": true,
+    "**/.matplotlib": true,
+    "**/.mplconfig_export": true,
+    "**/.mplconfig_test1": true,
+    "**/.mplconfig_test2": true,
+    "**/.mplconfig_test3": true,
+    "**/.mplconfig_test4": true,
+    "**/fontlist-v390.json": true,
+    "**/fontlist-v390.json.matplotlib-lock": true
+  }
+}

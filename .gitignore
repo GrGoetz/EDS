@@ -1,0 +1,11 @@
+__pycache__/
+.exspy/
+.hyperspy/
+.matplotlib/
+.mplconfig_export/
+.mplconfig_test1/
+.mplconfig_test2/
+.mplconfig_test3/
+.mplconfig_test4/
+fontlist-v390.json
+fontlist-v390.json.matplotlib-lock
